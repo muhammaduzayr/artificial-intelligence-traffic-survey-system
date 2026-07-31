@@ -1,0 +1,13 @@
+*.mp4
+
+venv/
+.venv/
+
+__pycache__/
+*.py[cod]
+*.pyo
+
+.env
+
+.vscode/
+.idea/

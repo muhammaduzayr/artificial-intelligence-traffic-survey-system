@@ -1,0 +1,6 @@
+ultralytics>=8.2.0
+av>=18.0.0
+opencv-python>=4.9.0
+pandas>=2.2.0
+openpyxl>=3.1.0
+scipy>=1.10.0
