@@ -91,7 +91,16 @@ class ReportAggregator:
         # rolling 1-hour window = 4 x 15-min buckets (adjust if interval changes)
         window = max(1, 60 // self.interval_minutes)
         rolling = counts_per_interval.rolling(window=window, min_periods=1).sum()
-        peak_start = rolling.idxmax()
+        # pandas labels a trailing rolling sum at the END of its window, not
+        # the start — idxmax() alone returns the LAST 15-min bucket of the
+        # busiest hour (e.g. 08:45 for a peak spanning 08:00-09:00), which
+        # every caller then prints as if it were the hour's start. Shift
+        # back by the window's span to report the actual start instead.
+        # (Only exact once the window is fully populated; a peak found
+        # inside the first partial window near the survey's start is a
+        # rarer, lower-stakes case where this shift can undershoot slightly.)
+        peak_window_end = rolling.idxmax()
+        peak_start = peak_window_end - timedelta(minutes=self.interval_minutes * (window - 1))
         return peak_start, int(rolling.max())
 
     def export(self, output_dir=None, basename="traffic_survey_report"):
