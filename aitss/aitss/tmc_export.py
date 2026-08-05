@@ -264,10 +264,24 @@ def export_tmc_report(raw_df, survey_start_time, output_path, interval_minutes=1
     template — styling, the Direction sheet, per-sheet arrow diagrams,
     merged cells — is preserved exactly as-is.
 
+    interval_minutes: currently unused — row placement is derived from the
+        template's own pre-filled time column (see _time_to_row), which is
+        baked in at 15-minute rows. Kept as a parameter for API
+        compatibility with callers that pass config.INTERVAL_MINUTES
+        explicitly; asserted here rather than silently ignored so a future
+        non-15 value fails loudly instead of producing a report that
+        quietly doesn't match what was requested.
+
     Returns (output_path, unplaced_labels) — unplaced_labels lists any
     zone labels found in the data that didn't match the N/E/S/W + 1-4
     pattern and so couldn't be placed anywhere in this template.
     """
+    if interval_minutes != 15:
+        raise ValueError(
+            f"export_tmc_report() only supports interval_minutes=15 — the "
+            f"template's time column is baked in at 15-minute rows and "
+            f"ignores this argument's value ({interval_minutes} was passed)."
+        )
     if not os.path.exists(config.TMC_TEMPLATE_PATH):
         raise FileNotFoundError(
             f"TMC template not found at {config.TMC_TEMPLATE_PATH}. Copy "

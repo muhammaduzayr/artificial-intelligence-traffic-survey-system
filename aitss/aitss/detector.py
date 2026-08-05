@@ -64,7 +64,6 @@ def _get_daytime_lut():
     g = 0.90  # mild brightening for daytime — lifts midtones without washing highlights
     return (np.array([(i / 255.0) ** g for i in range(256)], dtype=np.float32) * 255).astype(np.uint8)
 
-_daytime_lut = None
 
 def _enhance_frame(frame):
     """Contrast enhancement + sharpening for CCTV footage.
@@ -121,6 +120,18 @@ def _in_ignore_zone(cx, cy):
                for x1, y1, x2, y2 in config.IGNORE_ZONES)
 
 
+def _predicted_position_in_occluder(pred_x, pred_y, occluders=None, margin=None):
+    """Return whether a predicted position falls inside a known, fixed
+    occluder zone (a pole, sign, or barrier at a constant pixel location).
+    """
+    if occluders is None:
+        occluders = config.KNOWN_OCCLUDERS
+    if margin is None:
+        margin = config.OCCLUDER_MARGIN_PX
+    return any(x1 - margin <= pred_x <= x2 + margin and y1 - margin <= pred_y <= y2 + margin
+               for x1, y1, x2, y2 in occluders)
+
+
 class _PerTrackKF:
     """Constant-velocity Kalman filter for centroid smoothing.
 
@@ -137,9 +148,12 @@ class _PerTrackKF:
         self.P = np.eye(4, dtype=np.float64) * 20.0
         # Process noise: higher values = filter trusts measurements more,
         # responds faster to turns.  Q[0:2]=position, Q[2:4]=velocity.
-        # Increased from 4/2 to 10/5 so the KF catches turning vehicles
-        # rather than coasting straight through the turn.
-        self.Q = np.diag([10.0, 10.0, 5.0, 5.0]).astype(np.float64)
+        # Increased from 4/2 to 10/5, then 5/5 to 8/8 on the velocity terms
+        # so the KF adapts to a direction change mid-turn instead of
+        # coasting straight through it.  Too high and straight-line
+        # tracking gets twitchy — re-check straight segments if this is
+        # raised further.
+        self.Q = np.diag([10.0, 10.0, 8.0, 8.0]).astype(np.float64)
         # Base measurement noise, overridable per-model via the tuning
         # profile (lower = trust each detection more; higher = smoother,
         # slower to react).
@@ -203,11 +217,18 @@ class _PerTrackKF:
 
 
 class VehicleDetector:
-    def __init__(self, model_path=None, conf=None, classes=None, imgsz=None, device=None):
+    def __init__(self, model_path=None, conf=None, classes=None, imgsz=None, device=None,
+                 occluders=None):
         print(f"Optimal (Hungarian) track assignment: "
               f"{'ON' if _SCIPY_AVAILABLE else 'OFF (scipy missing — using greedy fallback, see requirements.txt)'}")
 
         self.device = _resolve_device(device or config.DEVICE)
+
+        # Per-camera known-occluder boxes (poles, signs, fixed foliage).
+        # Falls back to the single-camera config.KNOWN_OCCLUDERS default
+        # when the caller doesn't supply a per-video list (see
+        # zone_picker.load_occluders — main.py passes that in per video).
+        self.occluders = occluders if occluders is not None else config.KNOWN_OCCLUDERS
 
         # Always load the native PyTorch model for tracking — OpenVINO's
         # model.track() has a known bug where numpy array inputs trigger
@@ -218,8 +239,32 @@ class VehicleDetector:
         self.tuning = config.get_tuning_profile(pt_path)
         print(f"Using tuning profile for {os.path.basename(str(pt_path))}: {self.tuning}")
         self.model = YOLO(pt_path, task="detect")
+
+        # Class-id -> category-name mapping. Custom-trained checkpoints (e.g.
+        # the aitss_v4.pt fine-tune) have their own detection head trained
+        # directly on our category names, so their ids already ARE the
+        # categories and don't follow COCO's numbering at all. Detect this
+        # from what the loaded checkpoint itself reports (self.model.names)
+        # rather than assuming — a hardcoded COCO_TO_CATEGORY lookup against
+        # a custom model's ids silently drops most detections (wrong ids
+        # filtered out by self.classes) and mislabels the rest.
+        model_names = dict(self.model.names or {})
+        if model_names and set(model_names.values()) <= set(config.ALL_CATEGORIES):
+            self._cls_id_to_category = model_names
+            self._model_is_custom = True
+        else:
+            self._cls_id_to_category = config.COCO_TO_CATEGORY
+            self._model_is_custom = False
+
         self.conf = conf or config.CONFIDENCE_THRESHOLD
-        self.classes = classes or config.VEHICLE_CLASS_IDS
+        if classes is not None:
+            self.classes = classes
+        elif self._model_is_custom:
+            # Every class in a custom checkpoint is already a vehicle
+            # category — no COCO non-vehicle classes to filter out.
+            self.classes = list(self._cls_id_to_category.keys())
+        else:
+            self.classes = config.VEHICLE_CLASS_IDS
 
         # Sanity check: the global conf floor passed to YOLO must sit at
         # or below every per-class floor in MIN_CONF_BY_CLASS, or a
@@ -270,8 +315,15 @@ class VehicleDetector:
         # expires. Buckets are coarse enough to tolerate small bbox jitter.
         self._location_static_history = defaultdict(lambda: deque(maxlen=30))
 
-        # Bounding-box size history for bbox smoothing.
-        self._track_bbox_history = defaultdict(lambda: deque(maxlen=5))
+        # Bounding-box size history for bbox smoothing. Window shortened
+        # from 5 to 3 (2026-08-05): confirmed on real footage that a
+        # 5-frame median lagged visibly behind a car's true size for
+        # ~0.4-0.5s while it approached the camera (box smaller than and
+        # offset from the real vehicle before catching back up) — 3 keeps
+        # the same odd-length median-of-history smoothing behavior but
+        # reacts faster to genuine size changes, at the cost of slightly
+        # more size jitter on steady, non-accelerating vehicles.
+        self._track_bbox_history = defaultdict(lambda: deque(maxlen=3))
 
         # Centroid smoothing: progressive median-based smoothing (see
         # _smooth_centroids).  Uses _track_centroid_history from the
@@ -287,6 +339,20 @@ class VehicleDetector:
         # rejects an update.  Read by the next frame's _smoothed_category
         # to down-weight that frame's category vote.
         self._kf_update_rejected = {}
+
+        # tid -> last KF velocity heading (radians), for the turn-rate
+        # exception in _detection_is_good.  A turning vehicle's bbox area
+        # legitimately changes as it goes broadside-on to the camera; this
+        # lets that be told apart from an occlusion-corrupted box.
+        self._track_heading = {}
+
+        # tid -> frame_idx a track's KF-predicted position first fell inside
+        # a config.KNOWN_OCCLUDERS zone while unmatched.  Used to (a) exempt
+        # the track from the normal stale-track buffer while hidden behind a
+        # known fixed obstruction, and (b) widen the re-acquisition matching
+        # distance once it predicts back out the other side, bounded by how
+        # long it was actually hidden rather than the generic max_dist.
+        self._track_occluder_since = {}
 
         # ── Per-run model-characterization metrics ───────────────────
         # Collects the three numbers needed to fill in real per-model
@@ -480,6 +546,41 @@ class VehicleDetector:
         """
         self._protected_tracks.add(tid)
 
+    def relink_kf(self, old_tid, new_tid):
+        """Carry Kalman-filter state from an old track_id to a new one
+        across an ID switch confirmed by ZoneCounter._relink_orphans.
+
+        Called AFTER track_stream() has already run its per-frame KF step
+        for this frame, which means new_tid's KF (if it's not brand new)
+        already exists and is already correctly positioned from this
+        frame's real detection. Only the old track's velocity is worth
+        carrying across — its position is stale (up to
+        ZONE_RELINK_MAX_FRAMES old) and overwriting new_tid's fresh
+        position with it caused a visible jump-then-snap-back flicker.
+        _kf_last_frame is deliberately left untouched for the same reason:
+        it's already correct for new_tid.
+
+        Falls back to moving the whole KF over when new_tid has no KF yet
+        (shouldn't happen given the call ordering, but don't assume it).
+        """
+        if old_tid in self._kf and new_tid in self._kf:
+            self._kf[new_tid].x[2] = self._kf[old_tid].x[2]
+            self._kf[new_tid].x[3] = self._kf[old_tid].x[3]
+            self._kf.pop(old_tid, None)
+            self._kf_last_frame.pop(old_tid, None)
+            self._kf_smooth.pop(old_tid, None)
+        else:
+            if old_tid in self._kf:
+                self._kf[new_tid] = self._kf.pop(old_tid)
+            if old_tid in self._kf_last_frame:
+                self._kf_last_frame[new_tid] = self._kf_last_frame.pop(old_tid)
+            if old_tid in self._kf_smooth:
+                self._kf_smooth[new_tid] = self._kf_smooth.pop(old_tid)
+        if old_tid in self._track_heading:
+            self._track_heading[new_tid] = self._track_heading.pop(old_tid)
+        if old_tid in self._track_area_history:
+            self._track_area_history[new_tid] = self._track_area_history.pop(old_tid)
+
     def _smooth_centroids(self, detections):
         """Smooth centroid positions with progressive strength.
 
@@ -615,9 +716,20 @@ class VehicleDetector:
                     kf = self._kf[tid]
                     kf.predict(dt)
                     self._kf_last_frame[tid] = frame_idx
+
+                # Track recent heading change alongside position, so a
+                # legitimate turn can be told apart from an occlusion-
+                # corrupted box in _detection_is_good's area gate.
+                heading = math.atan2(kf.x[3], kf.x[2])
+                prev_heading = self._track_heading.get(tid)
+                turn_rate = 0.0
+                if prev_heading is not None:
+                    turn_rate = abs((heading - prev_heading + math.pi) % (2 * math.pi) - math.pi)
+                self._track_heading[tid] = heading
+
                 cat = d.get("category")
                 self._kf_update_attempts[cat] += 1
-                if self._detection_is_good(tid, area, conf, category=cat):
+                if self._detection_is_good(tid, area, conf, category=cat, turn_rate=turn_rate):
                     self._kf_update_passed[cat] += 1
                     self._kf_update_rejected.pop(tid, None)
                     # Clamped update: always correct toward the measurement
@@ -661,7 +773,13 @@ class VehicleDetector:
             self._kf_smooth[tid] = blended
             d["centroid_kf_smooth"] = blended
 
-    def _detection_is_good(self, tid, area, conf, category=None):
+    # Radians/frame of heading change above which a track is considered
+    # "turning fast" for the area-gate exception below.  Tune by watching
+    # real turns; this is a KF-velocity heading delta, not a raw-detection
+    # angle, so it's already smoothed by the filter's own motion model.
+    _FAST_TURN_RATE_RAD = 0.3
+
+    def _detection_is_good(self, tid, area, conf, category=None, turn_rate=0.0):
         """Return True when a detection is reliable enough for a KF update.
 
         Rejects:
@@ -680,6 +798,15 @@ class VehicleDetector:
             valid small-vehicle updates. Both the relative AND absolute
             change must be large before rejecting.
 
+        A vehicle turning broadside-on to the camera genuinely changes its
+        bbox area/aspect — that looks identical to an occlusion-corrupted
+        box to the area gate above.  When *turn_rate* (radians/frame of
+        recent KF heading change) is high, the area-change threshold is
+        relaxed so a real turn isn't rejected mid-turn.  Without this,
+        raising the KF's Q velocity terms alone only gets half the benefit:
+        position tracks through the turn while the detection still gets
+        rejected here.
+
         Position-plausibility is handled by the clamped update in
         _kalman_step, not by a binary reject gate here.
         """
@@ -695,7 +822,10 @@ class VehicleDetector:
             return True
         rel_change = abs(area - median_area) / median_area
         abs_change = abs(area - median_area)
-        if rel_change > self.tuning["area_change_threshold"] and abs_change > 400:
+        effective_area_threshold = self.tuning["area_change_threshold"]
+        if turn_rate > self._FAST_TURN_RATE_RAD:
+            effective_area_threshold *= 1.8  # more tolerant during a turn
+        if rel_change > effective_area_threshold and abs_change > 400:
             return False
         return True
 
@@ -859,6 +989,22 @@ class VehicleDetector:
     # match than to accidentally swap.
     _PROTECTED_MATCH_COST = 0.5
 
+    # Weight of the appearance-similarity term added to the match cost
+    # below (see the HISTCMP_CORREL comparison in the cost-matrix loop).
+    # Purely additive on top of the existing distance/IoU/size cost, and
+    # only applied when both sides have a real descriptor — so a pair with
+    # no appearance data (degenerate crop) matches exactly as it did
+    # before this was added. This is what stops the tracker latching onto
+    # a different nearby same-category vehicle (e.g. two cars passing
+    # close together) purely because it was marginally closer in one
+    # frame: distance/IoU/size alone can't tell two same-class vehicles
+    # apart, appearance usually can. Kept modest (max contribution 0.5 *
+    # this weight) since the HSV histogram is noisy on its own — see the
+    # 0.13-0.83 same-vehicle similarity spread noted next to
+    # config.ZONE_RELINK_MIN_APPEARANCE_SIMILARITY, which uses the same
+    # descriptor for the same reason.
+    _APPEARANCE_MATCH_WEIGHT = 0.25
+
     def _match_detections(self, detections, frame_gap, frame_idx):
         """Match raw detections to tracks using Kalman + IoU + distance.
 
@@ -890,7 +1036,10 @@ class VehicleDetector:
                 bbox = d["bbox"]
                 area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
                 cat = self._smoothed_category(tid, d["category"], d["conf"], bbox_area=area)
-                self._locked_category[tid] = cat
+                # NOTE: category is NOT locked here — let the vote stabilize
+                # over the first few frames.  Locking is only done at
+                # start-line crossing (ZoneCounter calls lock_category),
+                # when we have enough history to be confident.
                 result.append({**d, "track_id": tid, "category": cat, "age": 1})
             return result
 
@@ -924,6 +1073,22 @@ class VehicleDetector:
 
         max_dist = 150 * frame_gap
 
+        # Per-track override: a track whose predicted position was inside a
+        # known occluder (config.KNOWN_OCCLUDERS) recently gets a widened
+        # re-acquisition distance, bounded by how long it was actually
+        # hidden and its last known speed — a known bounded gap, not an
+        # open-ended one — instead of the flat max_dist every other track
+        # uses.
+        track_max_dist = {}
+        for tid, _state, _pos, _protected, (vx, vy) in track_items:
+            since = self._track_occluder_since.get(tid)
+            if since is not None:
+                hidden_frames = max(1, frame_idx - since)
+                speed = (vx ** 2 + vy ** 2) ** 0.5
+                track_max_dist[tid] = max(max_dist, speed * hidden_frames * 1.5)
+            else:
+                track_max_dist[tid] = max_dist
+
         n_det = len(detections)
         n_trk = len(track_items)
 
@@ -937,9 +1102,10 @@ class VehicleDetector:
             det_area = det_w * det_h
             for ti, (tid, state, (px, py), _protected, (vx, vy)) in enumerate(track_items):
                 dist = ((dcx - px) ** 2 + (dcy - py) ** 2) ** 0.5
-                if dist > max_dist:
+                eff_max_dist = track_max_dist[tid]
+                if dist > eff_max_dist:
                     continue
-                dist_score = dist / max_dist
+                dist_score = dist / eff_max_dist
                 iou = self._bbox_iou(dbox, state["bbox"])
                 if iou > 0.1:
                     # Boxes overlap — IoU is a strong signal
@@ -953,11 +1119,28 @@ class VehicleDetector:
                                   if max(det_area, trk_area) > 0 else 0.0)
                     # Base cost: distance dominates, size helps disambiguate.
                     combined = dist_score * 0.7 + (1.0 - area_ratio) * 0.3
-                    # Direction consistency ONLY for protected tracks
-                    # (those that crossed a start line).  An ID swap here
-                    # would orphan the crossing state and lose the count.
-                    # Regular tracks need the freedom to match across turns
-                    # or they get lost at intersections.
+                    # Direction consistency: an established track has a
+                    # KF velocity vector; a candidate detection lying
+                    # roughly BEHIND that vector (dot product < 0) is
+                    # suspicious — real vehicles don't reverse course
+                    # frame-to-frame, but a same-class neighbour a few
+                    # pixels away in dense/crossing traffic (queued
+                    # motorcycles, or two vehicles on opposite/converging
+                    # routes passing close together) can otherwise look
+                    # like the closer, cheaper match.  This is exactly the
+                    # failure mode that shows up as the centroid jumping
+                    # to a different vehicle when traffic is heavy.
+                    #
+                    # Protected tracks (already crossed a start line — an
+                    # ID swap here would orphan the crossing state and
+                    # lose the count) use a strict version of this check,
+                    # unchanged from before.  Regular tracks now get a
+                    # lighter version of the same check: a higher speed
+                    # floor (so queued/near-stationary jitter can't
+                    # trigger it) and a smaller penalty (so a real turn
+                    # isn't rejected outright — just made less attractive
+                    # than a forward-consistent alternative when one
+                    # exists).
                     if _protected:
                         direction_penalty = 0.0
                         v_norm_sq = vx * vx + vy * vy
@@ -970,6 +1153,23 @@ class VehicleDetector:
                         combined = (dist_score * 0.45
                                     + (1.0 - area_ratio) * 0.20
                                     + direction_penalty * 0.35)
+                    else:
+                        v_norm_sq = vx * vx + vy * vy
+                        if v_norm_sq > 16.0:  # speed > 4 px/frame — established motion, not jitter
+                            dx_pred = dcx - px
+                            dy_pred = dcy - py
+                            dot = vx * dx_pred + vy * dy_pred
+                            if dot < 0:
+                                combined += 0.12
+
+                # Appearance disambiguation (see _APPEARANCE_MATCH_WEIGHT).
+                det_app = det.get("appearance")
+                trk_app = state.get("appearance")
+                if det_app is not None and trk_app is not None:
+                    sim = cv2.compareHist(det_app, trk_app, cv2.HISTCMP_CORREL)
+                    sim = max(-1.0, min(1.0, sim))
+                    combined += (1.0 - sim) * 0.5 * self._APPEARANCE_MATCH_WEIGHT
+
                 cost_matrix[di, ti] = combined
                 any_valid = True
 
@@ -1093,6 +1293,10 @@ class VehicleDetector:
                 # confident.
                 result.append({**det, "track_id": tid, "category": cat, "age": self._track_age[tid]})
 
+        # Re-acquired — no longer hidden behind a known occluder.
+        for tid in matched_track_ids:
+            self._track_occluder_since.pop(tid, None)
+
         return result
 
     def _update_active_tracks(self, detections, frame_idx):
@@ -1104,12 +1308,21 @@ class VehicleDetector:
             if prev is None:
                 self._track_created_at.setdefault(tid, frame_idx)
             self._track_last_seen[tid] = frame_idx
+            # Carry the last known-good appearance descriptor forward when
+            # this frame's crop was degenerate (_compute_appearance
+            # returned None) rather than dropping it — _match_detections
+            # needs a track's most recent real descriptor to disambiguate
+            # against nearby same-category vehicles next frame.
+            appearance = d.get("appearance")
+            if appearance is None and prev is not None:
+                appearance = prev.get("appearance")
             entry = {
                 "centroid": d["centroid"],
                 "bbox": d["bbox"],
                 "category": d["category"],
                 "conf": d["conf"],
                 "last_frame": frame_idx,
+                "appearance": appearance,
             }
             if prev is not None:
                 # Store the actual number of video frames since last detection
@@ -1128,7 +1341,26 @@ class VehicleDetector:
         expired_tracks = []
         for tid, state in self._active_tracks.items():
             if tid not in new_tracks:
-                if frame_idx - state["last_frame"] < track_buffer_frames:
+                # If this track's KF-predicted position falls inside a
+                # known, fixed occluder (config.KNOWN_OCCLUDERS), it's
+                # known to be hidden rather than genuinely gone — exempt it
+                # from the normal stale-track schedule with an extended
+                # buffer instead.
+                if tid in self._kf:
+                    kf = self._kf[tid]
+                    dt = max(1, frame_idx - self._kf_last_frame.get(tid, frame_idx - 1))
+                    pred_x, pred_y = kf.peek(dt)
+                else:
+                    pred_x, pred_y = state["centroid"]
+
+                if _predicted_position_in_occluder(pred_x, pred_y, occluders=self.occluders):
+                    if tid not in self._track_occluder_since:
+                        self._track_occluder_since[tid] = frame_idx
+                    effective_buffer = track_buffer_frames * config.OCCLUDER_BUFFER_MULTIPLIER
+                else:
+                    effective_buffer = track_buffer_frames
+
+                if frame_idx - state["last_frame"] < effective_buffer:
                     new_tracks[tid] = state
                 else:
                     expired_tracks.append(tid)
@@ -1157,6 +1389,8 @@ class VehicleDetector:
             self._kf_smooth.pop(tid, None)
             self._kf_update_rejected.pop(tid, None)
             self._track_area_history.pop(tid, None)
+            self._track_heading.pop(tid, None)
+            self._track_occluder_since.pop(tid, None)
             self._retired_tracks.discard(tid)
             self._protected_tracks.discard(tid)
 
@@ -1186,6 +1420,40 @@ class VehicleDetector:
                 if not keep[j]:
                     continue
                 if sorted_dets[i]["category"] == sorted_dets[j]["category"]:
+                    continue
+                iou = VehicleDetector._bbox_iou(sorted_dets[i]["bbox"], sorted_dets[j]["bbox"])
+                if iou > iou_threshold:
+                    keep[j] = False
+        return [d for i, d in enumerate(sorted_dets) if keep[i]]
+
+    @staticmethod
+    def _same_class_nms(detections, iou_threshold=None):
+        """Same-class NMS dedup: a second, stricter pass on top of YOLO's
+        own built-in NMS (config.YOLO_NMS_IOU), for the same-class
+        duplicate boxes that survive it.
+
+        YOLO's own NMS is supposed to make this impossible for one class,
+        but confirmed on real footage: a single real motorcycle produced
+        two overlapping "Motorcycle" boxes (~0.4-0.5 IoU) that both
+        survived and became two simultaneous tracks on one vehicle — a
+        genuine double-count. Weaker classes (Motorcycle mAP50-95 0.38)
+        have noisier box regression than YOLO_NMS_IOU=0.65 assumes, so
+        this runs a second pass at config.SAME_CLASS_NMS_IOU (stricter
+        than YOLO_NMS_IOU) to catch what the model's own NMS missed.
+        """
+        if iou_threshold is None:
+            iou_threshold = config.SAME_CLASS_NMS_IOU
+        if len(detections) < 2:
+            return detections
+        sorted_dets = sorted(detections, key=lambda d: -d["conf"])
+        keep = [True] * len(sorted_dets)
+        for i in range(len(sorted_dets)):
+            if not keep[i]:
+                continue
+            for j in range(i + 1, len(sorted_dets)):
+                if not keep[j]:
+                    continue
+                if sorted_dets[i]["category"] != sorted_dets[j]["category"]:
                     continue
                 iou = VehicleDetector._bbox_iou(sorted_dets[i]["bbox"], sorted_dets[j]["bbox"])
                 if iou > iou_threshold:
@@ -1248,13 +1516,29 @@ class VehicleDetector:
 
             # A static false positive can churn through many track IDs, so
             # keep a second history keyed by its coarse image location.
+            #
+            # IMPORTANT: this must count DISTINCT track_ids revisiting the
+            # cell, not raw hit count — a single real vehicle idling at a
+            # red light (extremely common in dense/queued traffic) revisits
+            # its own grid cell every inference frame it's stopped in, and
+            # a stop of ~36s+ (900 frames) alone was enough to cross the
+            # old raw-hit-count-of-10 threshold and get this vehicle's own,
+            # perfectly genuine track rejected outright — which produced
+            # exactly the flicker/ID-churn symptom this filter was meant to
+            # prevent, just on real traffic instead of foliage. Churn
+            # (many different short-lived IDs cycling through the same
+            # spot) is the actual static-false-positive signature; one ID
+            # sitting there a long time is not.
             grid_key = (int(centroid[0]) // 20, int(centroid[1]) // 20)
             loc_hist = self._location_static_history[grid_key]
-            loc_hist.append(frame_idx)
-            if len(loc_hist) >= 10 and (loc_hist[-1] - loc_hist[0]) < 900:
-                print(f"[REJECTED-LOCATION] frame={frame_idx} grid={grid_key} "
-                      f"track={tid} cat={d['category']}")
-                continue
+            loc_hist.append((frame_idx, tid))
+            if len(loc_hist) >= 10 and (loc_hist[-1][0] - loc_hist[0][0]) < 900:
+                distinct_tids = {t for _, t in loc_hist}
+                if len(distinct_tids) >= 5:
+                    print(f"[REJECTED-LOCATION] frame={frame_idx} grid={grid_key} "
+                          f"track={tid} cat={d['category']} "
+                          f"distinct_ids={len(distinct_tids)}")
+                    continue
 
             if len(hist) >= config.STATIC_MIN_SAMPLES:
                 # Max pairwise distance
@@ -1282,52 +1566,30 @@ class VehicleDetector:
             result.append(d)
         return result
 
-    def _apply_detection_filters(self, raw_detections):
-        """Shared filter pass for both FRAME_SKIP=1 and FRAME_SKIP>1 paths.
+    @staticmethod
+    def _compute_appearance(frame, bbox):
+        """Cheap appearance descriptor for re-ID: a normalized HSV color
+        histogram of the detection's crop.
 
-        Applies bbox size, aspect-ratio, class-vs-aspect, and class-vs-area
-        filters to a list of raw detector outputs.
-        Each dict in raw_detections must have keys: bbox (x1,y1,x2,y2),
-        centroid (cx, cy), and cls_id (YOLO class integer).
-        Returns the filtered list.
+        Only ever computed on real inference-frame detections (never every
+        frame for every track), and only ever consumed by ZoneCounter at
+        the rare moment a track vanishes/reappears — so the per-call cost
+        here is negligible against YOLO inference itself.
+
+        Returns None (not an error) for a degenerate/out-of-frame bbox;
+        callers treat that as "no appearance data" and fail open rather
+        than reject a relink over missing data.
         """
-        out = []
-        for d in raw_detections:
-            x1, y1, x2, y2 = d["bbox"]
-            w = x2 - x1
-            h = y2 - y1
-            cls_id = d.get("cls_id")
-
-            # Minimum bbox size
-            if w < config.MIN_BBOX_WIDTH or h < config.MIN_BBOX_HEIGHT:
-                continue
-
-            # Aspect-ratio sanity
-            aspect = w / h if h > 0 else 0
-            if aspect < config.MIN_BBOX_ASPECT or aspect > config.MAX_BBOX_ASPECT:
-                continue
-
-            # Class-vs-aspect sanity
-            if cls_id is not None:
-                cls_aspect = config.CLASS_ASPECT_RANGE.get(cls_id)
-                if cls_aspect is not None:
-                    min_a, max_a = cls_aspect
-                    if min_a is not None and aspect < min_a:
-                        continue
-                    if max_a is not None and aspect > max_a:
-                        continue
-
-            # Class-vs-area sanity
-            area = w * h
-            max_area = config.CLASS_MAX_BBOX_AREA.get(cls_id) if cls_id is not None else None
-            min_area = config.CLASS_MIN_BBOX_AREA.get(cls_id) if cls_id is not None else None
-            if max_area is not None and area > max_area:
-                continue
-            if min_area is not None and area < min_area:
-                continue
-
-            out.append(d)
-        return out
+        x1, y1, x2, y2 = (int(v) for v in bbox)
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        crop = frame[y1:y2, x1:x2]
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+        cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+        return hist
 
     def _inference_frame(self, frame):
         """Run YOLO detection and return filtered detections with NMS tuning."""
@@ -1390,14 +1652,18 @@ class VehicleDetector:
 
             for box, cls_id, conf in zip(xyxy, cls_ids, confs):
                 conf = float(conf)
-                if cls_id == 3:
+                # Resolve category FIRST (from whichever id scheme the
+                # loaded checkpoint actually uses — see __init__) so every
+                # per-class lookup below is keyed by name, not raw id.
+                category = self._cls_id_to_category.get(int(cls_id), "Car")
+                if category == "Motorcycle":
                     n_yolo_raw_mc += 1
 
                 # Per-class confidence floor.
-                min_conf = config.MIN_CONF_BY_CLASS.get(int(cls_id), config.CONFIDENCE_THRESHOLD)
+                min_conf = config.MIN_CONF_BY_CLASS.get(category, config.CONFIDENCE_THRESHOLD)
                 if conf < min_conf:
                     n_cls_reject += 1
-                    if cls_id == 3:
+                    if category == "Motorcycle":
                         n_cls_reject_mc += 1
                     continue
 
@@ -1420,7 +1686,7 @@ class VehicleDetector:
                 # the assigned class (e.g. a super-narrow box classified as Car
                 # is almost certainly a Motorcycle, and a super-wide box
                 # classified as Motorcycle is almost certainly a Car/Truck).
-                cls_aspect = config.CLASS_ASPECT_RANGE.get(int(cls_id))
+                cls_aspect = config.CLASS_ASPECT_RANGE.get(category)
                 if cls_aspect is not None:
                     min_a, max_a = cls_aspect
                     if min_a is not None and aspect < min_a:
@@ -1433,8 +1699,8 @@ class VehicleDetector:
                 # Bbox-area class sanity: reject physically impossible
                 # class+size combinations (e.g. a 10-pixel box labeled "Bus").
                 area = w * h
-                max_area = config.CLASS_MAX_BBOX_AREA.get(int(cls_id))
-                min_area = config.CLASS_MIN_BBOX_AREA.get(int(cls_id))
+                max_area = config.CLASS_MAX_BBOX_AREA.get(category)
+                min_area = config.CLASS_MIN_BBOX_AREA.get(category)
                 if max_area is not None and area > max_area:
                     n_class_area_reject += 1
                     continue
@@ -1451,12 +1717,13 @@ class VehicleDetector:
                     self._diag["ignore_zone_reject"] += 1
                     continue
 
-                category = config.COCO_TO_CATEGORY.get(int(cls_id), "Car")
-
-                # Refine COCO class 7: bbox area > threshold → Truck.
+                # Refine "Light Truck" (COCO's undifferentiated Truck class,
+                # stock models only): bbox area > threshold -> "Truck".
                 # Threshold is resolution-adaptive: scaled by (imgsz/1280)²
-                # so a 960px run uses ~0.56× the default threshold.
-                if int(cls_id) == 7:
+                # so a 960px run uses ~0.56× the default threshold. Custom
+                # checkpoints already output "Truck" directly, so this is a
+                # no-op for them.
+                if category == "Light Truck":
                     scale_factor = (self.imgsz / 1280.0) ** 2
                     truck_thresh = config.TRUCK_REFINE_AREA_THRESHOLD * scale_factor
                     if area > truck_thresh:
@@ -1470,12 +1737,21 @@ class VehicleDetector:
                     "category": category,
                     "conf": conf,
                     "cls_id": int(cls_id),
+                    # Re-ID signature for ZoneCounter's orphan-relink gate —
+                    # cheap to compute here (real inference frame, real
+                    # pixels), and downstream code already carries unknown
+                    # dict keys forward via **d spreads, so this reaches
+                    # ZoneCounter without any other plumbing.
+                    "appearance": self._compute_appearance(frame, (x1, y1, x2, y2)),
                 })
 
         n_before_xnms = len(raw_detections)
         # Cross-class NMS: suppress lower-confidence detection when two
         # different classes (e.g. Bus + Motorcycle) overlap on the same vehicle.
         raw_detections = self._cross_class_nms(raw_detections)
+        # Same-class NMS: catches same-class duplicate boxes on one vehicle
+        # that YOLO's own NMS missed (see _same_class_nms docstring).
+        raw_detections = self._same_class_nms(raw_detections)
         n_cross_suppress = n_before_xnms - len(raw_detections)
 
         self._diag["frames"] += 1
@@ -1498,35 +1774,6 @@ class VehicleDetector:
                   f"passed={d['passed']} MC survival={mc_survival:.0f}%")
 
         return raw_detections
-
-    def print_diag(self):
-        d = self._diag
-        print(f"[DIAG FINAL] {d['frames']} inf frames:")
-        print(f"  YOLO raw:              {d['yolo_raw']} ({d['yolo_raw_mc']} MC)")
-        print(f"  Per-class filter:      {d['cls_reject']} ({d['cls_reject_mc']} MC)")
-        print(f"  Bbox size/aspect:      {d['bbox_reject']}")
-        print(f"  Class-area mismatch:   {d['class_area_reject']}")
-        print(f"  Ignore-zone filter:    {d['ignore_zone_reject']}")
-        print(f"  Cross-class NMS:       {d['cross_suppress']}")
-        print(f"  Passed to tracker:     {d['passed']}")
-        print(f"  Track births:          {d['track_created']}")
-        print(f"  Births near unseen ID: {d['track_near_disappeared']} "
-              f"(within relink window/radius)")
-        total_reject = (d['cls_reject'] + d['bbox_reject'] + d['class_area_reject']
-                        + d['ignore_zone_reject'] + d['cross_suppress'])
-        print(f"  Total rejection rate:  {100*total_reject/max(d['yolo_raw'],1):.0f}%")
-        if d['yolo_raw_mc']:
-            mc_survive = d['yolo_raw_mc'] - d['cls_reject_mc'] - d['cross_suppress']
-            print(f"  MC pipeline: {mc_survive}/{d['yolo_raw_mc']} = {100*mc_survive/d['yolo_raw_mc']:.0f}% survival")
-        print(f"  KF update rate by category (how often a detection actually")
-        print(f"  corrected the filter, vs. predict-only coasting):")
-        for cat in sorted(self._kf_update_attempts):
-            attempts = self._kf_update_attempts[cat]
-            passed = self._kf_update_passed[cat]
-            rate = 100 * passed / attempts if attempts else 0
-            print(f"    {cat}: {passed}/{attempts} = {rate:.0f}%")
-        print(f"  Track lifespan range:  {min(self._track_created_at.values()) if self._track_created_at else 0}-"
-              f"{max(self._track_last_seen.values()) if self._track_last_seen else 0}")
 
     def print_model_metrics(self):
         """Print the three per-model characterization numbers at end of run.

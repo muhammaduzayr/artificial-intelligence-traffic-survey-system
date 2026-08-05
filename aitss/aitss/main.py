@@ -33,7 +33,7 @@ from .video_io import get_video_info, open_video, release_video
 from .zone_counter import ZoneCounter
 from .aggregator import ReportAggregator
 from .tmc_export import export_tmc_report, check_raw_df_for_double_counts
-from .zone_picker import load_zones
+from .zone_picker import load_zones, load_occluders
 
 
 @contextlib.contextmanager
@@ -333,8 +333,6 @@ def run(video_path, survey_start_time, save_debug_video=False, output_dir=None, 
         output_dir = os.path.join(output_dir, enumerator.strip())
     os.makedirs(output_dir, exist_ok=True)
 
-    detector = VehicleDetector(model_path=model_path, conf=conf, imgsz=imgsz, device=device)
-
     # Per-video zone lines: sidecar .zones.json takes priority;
     # fall back to config.py global defaults.
     start_lines, finish_lines = load_zones(video_path)
@@ -345,10 +343,26 @@ def run(video_path, survey_start_time, save_debug_video=False, output_dir=None, 
     else:
         print(f"Using per-video zones from {video_path}.zones.json")
 
+    # Per-video known-occluder boxes (poles, signs, fixed foliage) — same
+    # sidecar file as the zone lines, since both are specific to this
+    # camera's fixed framing. Falls back to config.KNOWN_OCCLUDERS (empty
+    # by default) when the sidecar has none defined.
+    occluders = load_occluders(video_path)
+    if occluders:
+        print(f"Using {len(occluders)} per-video known occluder(s) from {video_path}.zones.json")
+    else:
+        occluders = config.KNOWN_OCCLUDERS
+        print(f"Using global KNOWN_OCCLUDERS from config.py ({len(occluders)} zone(s))")
+
+    detector = VehicleDetector(model_path=model_path, conf=conf, imgsz=imgsz, device=device,
+                               occluders=occluders)
+
     counter = ZoneCounter(start_lines, finish_lines,
                            lock_category_fn=detector.lock_category,
                            retire_track_fn=detector.retire_track,
-                           protect_track_fn=detector.protect_track)
+                           protect_track_fn=detector.protect_track,
+                           relink_kf_fn=detector.relink_kf,
+                           diagnostic_csv_path=os.path.join(output_dir, "crossing_diagnostics.csv"))
     aggregator = ReportAggregator(survey_start_time)
 
     print(f"START_LINES: {list(start_lines.keys())}")
@@ -627,12 +641,57 @@ def run(video_path, survey_start_time, save_debug_video=False, output_dir=None, 
     print(f"Report (Excel): {excel_path}")
     print(f"Report (CSV):   {csv_path}")
     print(f"TMC Report (North/East/South/West): {tmc_path}")
+    print(f"Crossing diagnostics: {counter.diagnostic_csv_path}")
     if unplaced_labels:
         print(f"WARNING: these zone labels didn't match the N/S/E/W + 1-4 pattern and "
               f"were NOT included in the TMC report: {unplaced_labels}")
 
 
+def _warn_if_stale_pyc():
+    """Guard against silently testing stale compiled bytecode.
+
+    This package's directory can end up with standalone
+    <module>_cpython-*.pyc files sitting next to their .py sources (e.g.
+    from a packaging/build step) — a different layout from the normal
+    __pycache__ folder Python manages itself. If anything in the workflow
+    ever runs one of those .pyc files directly instead of the .py source,
+    an edit made during fast tuning iteration on detector.py/zone_counter.py
+    /etc. can go untested with no indication anything is wrong.
+
+    This is a cheap, non-fatal check: it warns (doesn't block) when a
+    source file is newer than a sibling compiled file of the same name, so
+    a stale .pyc doesn't go unnoticed. The reliable fix is still to always
+    run via `python -m aitss.main` from source rather than any .pyc, so
+    Python's own mtime-based invalidation stays in control — this is a
+    backstop for the case where that discipline slips.
+    """
+    pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    try:
+        entries = os.listdir(pkg_dir)
+    except OSError:
+        return
+    py_files = [e for e in entries if e.endswith(".py")]
+    pyc_files = [e for e in entries if e.endswith(".pyc")]
+    for py_name in py_files:
+        stem = py_name[:-3]
+        py_path = os.path.join(pkg_dir, py_name)
+        matching_pyc = [p for p in pyc_files if p.startswith(stem + "_cpython-")]
+        for pyc_name in matching_pyc:
+            pyc_path = os.path.join(pkg_dir, pyc_name)
+            try:
+                stale = os.path.getmtime(py_path) > os.path.getmtime(pyc_path)
+            except OSError:
+                continue
+            if stale:
+                print(f"WARNING: {py_name} has been edited more recently than "
+                      f"its compiled {pyc_name} — if anything in this workflow "
+                      f"runs that .pyc directly, it will silently test old "
+                      f"logic. Run via `python -m aitss.main` from source, or "
+                      f"delete stale __pycache__/*.pyc before testing.")
+
+
 def main():
+    _warn_if_stale_pyc()
     parser = argparse.ArgumentParser(description="AITSS core AI pipeline")
     parser.add_argument("--video", required=True, help="Path to recorded traffic video")
     parser.add_argument(

@@ -81,7 +81,7 @@ class AitssGui:
         self.enumerator = tk.StringVar()
         self.junction = tk.StringVar()
         self.junction_name = tk.StringVar()
-        self.model = tk.StringVar(value="yolo12s.pt")
+        self.model = tk.StringVar(value=aitss_config.MODEL_PATH)
         self.imgsz = tk.StringVar(value="960")
         self.debug_video = tk.BooleanVar(value=True)
         # Defaults to OFF, not True: the pipeline runs in a background

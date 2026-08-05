@@ -17,16 +17,20 @@ import os
 # Usage: set MODEL_PATH below, or override via `--model` (CLI) or the
 #        Model combobox in the GUI.
 AVAILABLE_MODELS = [
-    "yolo12s.pt",   # YOLOv12 small (default, balanced, ~18 MB)
+    "aitss_v4.pt",  # Fine-tuned yolov8n.pt on 1,626 hand-corrected AITSS frames
+                    # (all 8 CVAT tasks: S49/L04/L18, every angle) — actual default below
+    "yolo12s.pt",   # YOLOv12 small (balanced, ~18 MB)
     "yolo12n.pt",   # YOLOv12 nano (fastest CPU, ~5 MB)
     "yolo12m.pt",   # YOLOv12 medium (most accurate, ~50 MB)
     "yolo11s.pt",   # YOLOv11 small
     "yolo11n.pt",   # YOLOv11 nano
     "yolov8s.pt",   # YOLOv8 small (fast CPU, ~22 MB)
-    "yolov8n.pt",   # YOLOv8 nano (fastest CPU, ~6 MB)
+    "yolov8n.pt",   # YOLOv8 nano (fastest CPU, ~6 MB) — stock baseline, pre-fine-tune
 ]
 
-MODEL_PATH = "yolov8n.pt"
+# Fine-tuned checkpoint (training_data/runs/v4_dataset_v4/weights/best.pt) is now
+# the default. To go back to the stock baseline, set this to "yolov8n.pt".
+MODEL_PATH = "aitss_v4.pt"
 
 # When both YOLO class IDs and track votes disagree, force the track to use the
 # HIGHEST confidence single-frame detection as its category, instead of a
@@ -67,11 +71,27 @@ BYTETRACK_HIGH_CONF_THRESHOLD = 0.50
 # Per-class confidence floor.  The global threshold (0.03) gates YOLO output;
 # these per-class floors are identical for MC (same as global) and slightly
 # higher for larger vehicles where noise is less likely to be legitimate.
+# Keyed by CATEGORY NAME rather than raw YOLO class id, since the id numbering
+# differs between stock COCO checkpoints and custom-trained ones (e.g. the
+# aitss_v4.pt fine-tune has its own 0-3 head that doesn't match COCO's 2/3/5/7).
+# detector.py resolves id -> category first (see VehicleDetector.__init__),
+# then does every per-class lookup below by name so it works for either.
 MIN_CONF_BY_CLASS = {
-    2: 0.07,   # Car — 0.07 catches distant/blurry/night/angled cars (was 0.10)
-    3: 0.03,   # Motorcycle — matches global floor; catches small/distant MCs (was 0.05)
-    5: 0.30,   # Bus
-    7: 0.30,   # Truck
+    "Car": 0.07,          # 0.07 catches distant/blurry/night/angled cars (was 0.10)
+    # Raised from 0.03 (2026-08-05): at the bare global floor, confirmed on
+    # real debug-video footage that a persistent low-conf false positive on
+    # a pavement stain (no motorcycle present at all) accumulated enough
+    # admitted frames to pass MIN_TRACK_AGE and get counted as a real
+    # crossing — its best frame across its whole life was still only
+    # conf=0.033-0.045. Confirmed real (but small/distant) motorcycles in
+    # the same footage were conf=0.35-0.59, so 0.10 sits well clear of the
+    # observed phantom cluster while leaving real weak detections through.
+    # If this starts costing genuine small/distant MCs, re-check against
+    # fresh footage before lowering it back — don't just revert blind.
+    "Motorcycle": 0.10,
+    "Bus": 0.30,
+    "Truck": 0.30,
+    "Light Truck": 0.30,
 }
 
 # Confidence floor required before a detection is trusted enough to CORRECT
@@ -115,16 +135,18 @@ MAX_BBOX_ASPECT = 6.0    # width/height upper bound (e.g. very wide flat boxes)
 # bounds — they only catch extreme misclassifications, not borderline cases.
 # Areas are in pixel² at the inference resolution (1920×1080 source).
 CLASS_MAX_BBOX_AREA = {
-    2: 250000,  # Car — a ~500×500 box at IMGSZ (largest plausible single car)
-    3: 30000,   # Motorcycle — ~173×173 box at IMGSZ (up from 6000 which rejected close MCs)
-    5: 500000,  # Bus — ~707×707 box at IMGSZ (covers nearly full frame height)
-    7: 500000,  # Truck — same as Bus
+    "Car": 250000,          # ~500×500 box at IMGSZ (largest plausible single car)
+    "Motorcycle": 30000,    # ~173×173 box at IMGSZ (up from 6000 which rejected close MCs)
+    "Bus": 500000,          # ~707×707 box at IMGSZ (covers nearly full frame height)
+    "Truck": 500000,        # same as Bus
+    "Light Truck": 500000,
 }
 CLASS_MIN_BBOX_AREA = {
-    2: 40,      # Car — ~6×7 box at IMGSZ (was 60)
-    3: 20,      # Motorcycle — ~4×5 box at IMGSZ (tiny distant MCs, was 30)
-    5: 300,     # Bus — ~17×17 box (was 400)
-    7: 300,     # Truck — same as Bus
+    "Car": 40,          # ~6×7 box at IMGSZ (was 60)
+    "Motorcycle": 20,   # ~4×5 box at IMGSZ (tiny distant MCs, was 30)
+    "Bus": 300,         # ~17×17 box (was 400)
+    "Truck": 300,       # same as Bus
+    "Light Truck": 300,
 }
 
 # Static-object rejection (MAX PAIRWISE): if a track's centroid history's
@@ -146,6 +168,30 @@ IGNORE_ZONES = [
     (940, 100, 959, 139),
 ]
 
+# Known, FIXED obstructions — a pole, sign, or barrier that sits at the same
+# pixel spot every time because the camera doesn't move. This is different
+# from IGNORE_ZONES (which discards detections) and from generic occlusion
+# handling (which is unpredictable, vehicle-on-vehicle occlusion — see
+# ZONE_RELINK_* below): a known occluder is a place where we can say with
+# certainty "a vehicle predicted to be here that isn't detected this frame
+# is hidden, not gone." Map each by eye from this camera's fixed view as
+# (x1, y1, x2, y2). Empty by default — populate per-camera.
+KNOWN_OCCLUDERS = [
+    # (x1, y1, x2, y2)
+]
+
+# Pixel margin added around each KNOWN_OCCLUDERS box when testing whether a
+# track's predicted position falls inside it — accounts for the KF
+# prediction being a little off and for the vehicle's own bbox extending
+# past its centroid.
+OCCLUDER_MARGIN_PX = 15
+
+# While a track's KF-predicted position sits inside a known occluder and no
+# detection matches it, its stale-track buffer is extended by this
+# multiplier instead of expiring on the normal schedule — we know it isn't
+# really gone, just temporarily hidden behind something fixed.
+OCCLUDER_BUFFER_MULTIPLIER = 3
+
 # Per-class aspect-ratio sanity bounds: reject a detection when its
 # bbox aspect ratio (width/height) is physically implausible for the
 # assigned class.  A "Car" that is taller than it is wide (aspect < 0.5)
@@ -155,9 +201,10 @@ IGNORE_ZONES = [
 # Values widened for v2 to catch more camera angles (head-on cars,
 # side-view motorcycles).
 CLASS_ASPECT_RANGE = {
-    2: (0.25, None),          # Car: lower 0.3→0.25 (head-on cars)
-    3: (None, 3.0),           # Motorcycle: upper 2.5→3.0 (side-view MCs)
-    7: (0.4, None),           # Light Truck: unchanged
+    "Car": (0.25, None),          # lower 0.3→0.25 (head-on cars)
+    "Motorcycle": (None, 3.0),    # upper 2.5→3.0 (side-view MCs)
+    "Truck": (0.4, None),         # unchanged
+    "Light Truck": (0.4, None),
 }
 
 # --- Route tracking ---
@@ -212,12 +259,37 @@ YOLO_NMS_IOU = 0.65
 # (e.g. a car and motorcycle passing side-by-side).
 CROSS_CLASS_NMS_IOU = 0.5
 
+# Same-class NMS dedup threshold: a second pass on top of YOLO's own
+# built-in NMS (YOLO_NMS_IOU=0.65 above). Confirmed on real debug-video
+# footage (2026-08-05): a single real motorcycle produced two overlapping
+# "Motorcycle" boxes (~0.4-0.5 IoU) that both survived the model's own
+# NMS and became two separate simultaneous tracks on one vehicle — the
+# comment on YOLO_NMS_IOU assuming same-class overlap above 0.65 always
+# means one real vehicle does NOT hold for weaker classes (Motorcycle
+# mAP50-95 0.38), whose noisier box regression can produce two boxes for
+# one object without ever reaching 0.65 IoU. Lower/stricter than
+# YOLO_NMS_IOU on purpose — this is specifically for catching what the
+# model's own NMS missed, not a general "merge nearby vehicles" pass, so
+# it stays below CROSS_CLASS_NMS_IOU too (same-class duplicates of one
+# object are a stronger, less ambiguous signal than a cross-class overlap).
+SAME_CLASS_NMS_IOU = 0.4
+
 # Process every Nth frame for inference. 1 = process all frames.
 # 2 = process every other frame (half the inference calls, ~2x faster).
 # Motorcycles that only appear in skipped frames will be missed, but
 # ByteTrack's track_buffer keeps existing tracks alive across gaps.
 # Tune this based on your speed vs accuracy needs.
-FRAME_SKIP = 3
+#
+# Lowered from 3 to 2 once CUDA inference was enabled (~7 fps at
+# imgsz=1280 on an MX450 vs a few fps on CPU) — every inference frame the
+# KF goes to a real measurement instead of coasting on prediction, and a
+# smaller frame-to-frame gap directly shrinks how far a track's predicted
+# position can drift before the next correction. That drift-then-snap is
+# what shows up on screen as centroid "jumping," especially through
+# occlusion or dense traffic where several consecutive detections can be
+# missed/wrong. Drop to 1 if you have GPU headroom to spare (~3.5 fps at
+# imgsz=1280 on this card); raise back to 3 if running on CPU only.
+FRAME_SKIP = 2
 
 # ByteTrack config — switched back from BoT-SORT after benchmarking.
 # ByteTrack is significantly faster on CPU (no optical-flow GMC per
@@ -279,13 +351,18 @@ SHARPEN_SIGMA = 2.0       # Gaussian blur sigma for the mask
 GAMMA_CORRECT_THRESHOLD = 100   # activate night gamma when LAB-L < 100
 GAMMA_VALUE = 0.45
 
-# COCO class ids we care about (COCO names in comments).
+# COCO class ids we care about (COCO names in comments). Only relevant for
+# STOCK pretrained checkpoints (yolov8n.pt, yolo11n.pt, yolo12*.pt, ...) —
+# custom-trained checkpoints (aitss_v4.pt) have their own class head and
+# ignore this; detector.py's VehicleDetector picks between this and the
+# model's own names automatically based on what the loaded checkpoint reports.
 # 3 = motorcycle, 2 = car, 5 = bus, 7 = truck
 VEHICLE_CLASS_IDS = [2, 3, 5, 7]
 
 # COCO doesn't distinguish van / light truck / heavy truck out of the box.
-# For v1 we map every COCO "truck" to LIGHT_TRUCK by default; swapping this
-# for a custom-trained model (Phase 2+) will let you split light vs heavy.
+# We map every COCO "truck" to LIGHT_TRUCK by default; refined to "Truck" by
+# the bbox-area rule below. (Custom-trained checkpoints skip this entirely —
+# aitss_v4.pt was trained with "Truck" as its own class directly.)
 COCO_TO_CATEGORY = {
     2: "Car",
     3: "Motorcycle",
@@ -374,6 +451,27 @@ ZONE_RELINK_MAX_FRAMES = 45
 # keeping it tighter reduces the risk of merging two different vehicles.
 ZONE_RELINK_MAX_DIST_PX = 130
 
+# Appearance re-ID gate: on top of the distance + category checks above,
+# require the orphan's stored appearance (an HSV color histogram of its
+# last real detection crop — see VehicleDetector._compute_appearance) and
+# the new track's first-detection appearance to be at least this similar
+# (cv2.compareHist HISTCMP_CORREL, range [-1, 1], 1 = identical) before
+# bridging identities. This is what actually stops two different
+# same-category vehicles that happen to pass within ZONE_RELINK_MAX_DIST_PX
+# of each other from getting merged — distance + category alone can't tell
+# a white car from a silver car apart, appearance usually can.
+# None on either side (e.g. crop was empty/degenerate) skips this gate —
+# fail open to the old distance+category-only behavior rather than refusing
+# a relink over missing data.
+#
+# Was 0.5 — an unvalidated guess. A quick sanity check found same-vehicle
+# Car-vs-Car similarity ranging all over 0.13-0.83 (plain HSV histograms are
+# noisy across angle/lighting changes), so a 0.5 floor plausibly rejected a
+# lot of genuine same-vehicle relinks — that vehicle's identity never got
+# bridged, which reads as undercounting. Lowered to 0.3 as the next thing to
+# try; re-validate against counted totals once ground truth exists.
+ZONE_RELINK_MIN_APPEARANCE_SIMILARITY = 0.3
+
 
 # START_LINES — one line segment per entry approach, keyed by a label
 # (e.g. "S" for south entry, "N" for north entry).  When a tracked
@@ -381,8 +479,8 @@ ZONE_RELINK_MAX_DIST_PX = 130
 # crossing and begins tracking it for a future count.
 # Use python -m aitss.tools.pick_zone to click two endpoints per line.
 START_LINES = {
-    "N": [(754, 230), (794, 317)],
-    "S": [(1548, 243), (1651, 354)],
+    "N": [(809, 590), (1085, 466)],
+    "S": [(876, 299), (1019, 241)],
 }
 
 # FINISH_LINES — one line segment per exit direction, keyed by the lane
@@ -392,8 +490,8 @@ START_LINES = {
 #   lane = the finish line's key (e.g. "N1")
 #   direction = the finish line's key (the direction label IS the lane)
 FINISH_LINES = {
-    "S2": [(1137, 191), (1185, 266)],
-    "N2": [(1252, 266), (1385, 439)],
+    "S2": [(572, 317), (679, 277)],
+    "N2": [(1286, 417), (1365, 314)],
 }
 
 # Aggregation interval in minutes (per the proposal: 15-minute reports).
@@ -487,6 +585,37 @@ MODEL_TUNING_PROFILES = {
         "kf_measurement_noise": 10.0,
         "bytetrack_high_conf_threshold": 0.40,
     },
+    # aitss_v4.pt — fine-tuned yolov8n.pt on 1,626 hand-corrected AITSS
+    # frames (all 8 CVAT tasks: S49/L04/L18, every angle). Unlike the
+    # profiles above (which are inferred estimates — see print_model_metrics
+    # docstring), this one is grounded in an actual characterization run:
+    # detector.py's MODEL CHARACTERIZATION block on a held-out clip
+    # (L18 F2, never seen in training) measured:
+    #   1. Coasting-gap frequency : 0.0%   (0/1102 frames — never coasts)
+    #   2. Mean matched confidence: 0.608  (vs ~0.3 for the stock baselines
+    #      that motivated the lower thresholds below)
+    #   3. Straight-line centroid var: 1553 px² (2687 samples)
+    "aitss_v4.pt": {
+        "kf_smooth_alpha": 0.20,          # same as v8n lineage — cosmetic only
+                                           # (never affects counting), and detections
+                                           # are already consistently confident so no
+                                           # extra display damping is needed.
+        "area_change_threshold": 0.65,    # unrelated to confidence calibration, no
+                                           # evidence from this run to move it.
+        "kf_measurement_noise": 7.0,      # slightly BELOW v8n's 8.0 — 0% coasting-gap
+                                           # and much higher average confidence mean each
+                                           # individual detection is more trustworthy than
+                                           # what motivated v8n's own value.
+        "bytetrack_high_conf_threshold": 0.55,  # slightly ABOVE v8n's 0.50 — mean
+                                           # confidence (0.608) clears this with real
+                                           # margin, so raising the bar filters rare
+                                           # low-confidence noise from spawning brand-new
+                                           # tracks while still freely admitting the vast
+                                           # majority of genuine detections.
+    },
+    # NOTE: this is a first-pass profile from a single 90s held-out clip.
+    # Worth re-running print_model_metrics() on a few more clips (different
+    # cameras/times of day) before treating these as final.
 }
 
 DEFAULT_TUNING_PROFILE = {

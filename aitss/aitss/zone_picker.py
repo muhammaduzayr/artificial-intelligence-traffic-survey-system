@@ -53,13 +53,68 @@ def save_zones(video_path, start_lines, finish_lines):
 
     *start_lines* and *finish_lines* are dicts
     {label: [(x1,y1), (x2,y2)], ...}.
+
+    Preserves an existing "known_occluders" entry in the sidecar file (set
+    via save_occluders) rather than clobbering it — the line-picker and
+    occluder-picker write to the same file independently.
     """
     import json
     path = _zones_path(video_path)
+    existing_occluders = None
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                existing_occluders = json.load(f).get("known_occluders")
+        except (OSError, json.JSONDecodeError):
+            existing_occluders = None
     data = {
         "start_lines": {k: [list(p) for p in v] for k, v in start_lines.items()},
         "finish_lines": {k: [list(p) for p in v] for k, v in finish_lines.items()},
     }
+    if existing_occluders is not None:
+        data["known_occluders"] = existing_occluders
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    return path
+
+
+def load_occluders(video_path):
+    """Load per-video known-occluder boxes from the sidecar JSON file.
+
+    Returns a list of (x1, y1, x2, y2) tuples, or None if the sidecar file
+    doesn't exist or has no "known_occluders" entry — callers should fall
+    back to config.KNOWN_OCCLUDERS (the single-camera default) in that case.
+
+    Kept in the same sidecar file as start/finish lines (one file per
+    camera/video) rather than in config.py, because a fixed obstruction
+    like a pole or tree is specific to one camera's framing — a global
+    list in config.py can't correctly serve more than one camera at once.
+    """
+    path = _zones_path(video_path)
+    if not os.path.exists(path):
+        return None
+    import json
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    occluders = data.get("known_occluders")
+    if occluders is None:
+        return None
+    return [tuple(box) for box in occluders]
+
+
+def save_occluders(video_path, occluders):
+    """Save per-video known-occluder boxes to the sidecar JSON file.
+
+    *occluders* is a list of (x1, y1, x2, y2) tuples. Preserves any
+    existing start_lines/finish_lines already in the sidecar file.
+    """
+    import json
+    path = _zones_path(video_path)
+    data = {"start_lines": {}, "finish_lines": {}}
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    data["known_occluders"] = [list(box) for box in occluders]
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     return path

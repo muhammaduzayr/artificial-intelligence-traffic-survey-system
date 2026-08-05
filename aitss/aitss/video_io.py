@@ -91,12 +91,18 @@ class PyAVCapture:
             self._frame_index = 0
             self._pending_frame = None
             target = max(0, int(frame_index or 0))
+            # Discard frames 0..target-1, then cache the frame AT target
+            # itself so read() lands exactly on the requested index instead
+            # of one frame early.
             while self._frame_index < target:
                 frame = next(self._iterator, None)
                 if frame is None:
                     return
                 self._frame_index += 1
-                self._pending_frame = frame
+            frame = next(self._iterator, None)
+            if frame is None:
+                return
+            self._pending_frame = frame
 
     def isOpened(self):
         return self._container is not None

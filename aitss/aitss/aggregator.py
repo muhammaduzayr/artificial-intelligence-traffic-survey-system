@@ -38,6 +38,12 @@ class ReportAggregator:
                     "direction": e.direction,
                     "category": e.category,
                     "track_id": e.track_id,
+                    "timestamp_sec": e.timestamp_sec,
+                    "frame_idx": e.frame_idx,
+                    "confidence_at_lock": e.conf,
+                    "relinked": e.relinked,
+                    "origin": e.origin,
+                    "origin_mismatch": e.origin_mismatch,
                 }
             )
 
@@ -71,6 +77,17 @@ class ReportAggregator:
         counts_per_interval = (
             df.groupby("interval_start").size().sort_index()
         )
+        # groupby() drops any interval with zero events entirely, so a
+        # rolling window over its result can silently span more than
+        # 4 x 15-min of real clock time whenever a bucket was empty.
+        # Reindex over the full contiguous interval range first (filling
+        # gaps with 0) so "1 hour" below always means a true clock hour.
+        full_index = pd.date_range(
+            start=counts_per_interval.index.min(),
+            end=counts_per_interval.index.max(),
+            freq=f"{self.interval_minutes}min",
+        )
+        counts_per_interval = counts_per_interval.reindex(full_index, fill_value=0)
         # rolling 1-hour window = 4 x 15-min buckets (adjust if interval changes)
         window = max(1, 60 // self.interval_minutes)
         rolling = counts_per_interval.rolling(window=window, min_periods=1).sum()
@@ -87,8 +104,8 @@ class ReportAggregator:
         excel_path = os.path.join(output_dir, f"{basename}.xlsx")
         csv_path = os.path.join(output_dir, f"{basename}.csv")
 
-        try:
-            with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+        def write_workbook(path):
+            with pd.ExcelWriter(path, engine="openpyxl") as writer:
                 summary.to_excel(writer, sheet_name="15min_summary", index=False)
                 raw.to_excel(writer, sheet_name="raw_events", index=False)
 
@@ -98,17 +115,16 @@ class ReportAggregator:
                     totals.columns = ["category", "count"]
                     totals["percentage"] = (100 * totals["count"] / totals["count"].sum()).round(1)
                     totals.to_excel(writer, sheet_name="category_totals", index=False)
+
+        try:
+            write_workbook(excel_path)
         except PermissionError:
+            # Excel keeps an open workbook locked on Windows. Preserve the
+            # completed run by writing a timestamped copy instead of losing
+            # it entirely.
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             fallback_excel_path = os.path.join(output_dir, f"{basename}_{timestamp}.xlsx")
-            with pd.ExcelWriter(fallback_excel_path, engine="openpyxl") as writer:
-                summary.to_excel(writer, sheet_name="15min_summary", index=False)
-                raw.to_excel(writer, sheet_name="raw_events", index=False)
-                if not raw.empty:
-                    totals = raw["category"].value_counts().reset_index()
-                    totals.columns = ["category", "count"]
-                    totals["percentage"] = (100 * totals["count"] / totals["count"].sum()).round(1)
-                    totals.to_excel(writer, sheet_name="category_totals", index=False)
+            write_workbook(fallback_excel_path)
             excel_path = fallback_excel_path
 
         summary.to_csv(csv_path, index=False)
