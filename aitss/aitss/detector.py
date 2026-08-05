@@ -1173,7 +1173,64 @@ class VehicleDetector:
                 cost_matrix[di, ti] = combined
                 any_valid = True
 
+        # ── Priority pass: protected tracks claim their best detection
+        # FIRST, before the general Hungarian solve ─────────────────────
+        # Hungarian minimizes the GLOBAL cost across all assignments, and
+        # when there are more tracks than detections (routine — many
+        # coasting/stale tracks vs. a handful of real detections) it is
+        # FORCED to leave some tracks unmatched even if their individual
+        # best cost is well under threshold, whenever doing so lets some
+        # other track claim that detection more cheaply overall. A
+        # protected track (already crossed a start line) losing its
+        # detection this way to a brand-new competing track is exactly
+        # the failure this class of bug produces: _relink_orphans in
+        # zone_counter.py bridges the COUNT back immediately, but the
+        # underlying identity keeps contesting the same detection frame
+        # to frame, which is what shows up on screen as the box/crosshair
+        # flickering or swapping onto a different vehicle.
+        #
+        # Confirmed via real dense-traffic footage (S49 P1, an ambulance
+        # closely followed by a car): a protected track with a clean,
+        # well-under-threshold best match (cost 0.355 vs the 0.5
+        # threshold) still went unmatched this way, triggering an
+        # immediate relink, flipped back the very next frame, and within
+        # 10 frames had swapped onto the other, physically different
+        # vehicle. Reserving each protected track's cheapest valid
+        # detection before the general solve runs means it can no longer
+        # be out-competed by a track with nothing at stake.
+        reserved_det = set()
+        reserved_trk = set()
         matched = []
+        if any_valid:
+            protected_pairs = []
+            for ti, (tid, _state, _pos, protected, _vel) in enumerate(track_items):
+                if not protected:
+                    continue
+                best_di, best_cost = None, None
+                for di in range(n_det):
+                    c = cost_matrix[di, ti]
+                    if c >= self._PROTECTED_MATCH_COST:
+                        continue
+                    if best_cost is None or c < best_cost:
+                        best_cost, best_di = c, di
+                if best_di is not None:
+                    protected_pairs.append((best_cost, best_di, ti))
+            # Cheapest-first so that if two protected tracks somehow want
+            # the same detection, the better-fitting one wins it.
+            protected_pairs.sort(key=lambda x: x[0])
+            for cost, di, ti in protected_pairs:
+                if di in reserved_det or ti in reserved_trk:
+                    continue
+                reserved_det.add(di)
+                reserved_trk.add(ti)
+                matched.append((di, track_items[ti][0]))
+            # Remove reserved rows/cols from further consideration — the
+            # general solve below only competes over what's left.
+            for di in reserved_det:
+                cost_matrix[di, :] = 10.0
+            for ti in reserved_trk:
+                cost_matrix[:, ti] = 10.0
+
         if any_valid and _SCIPY_AVAILABLE:
             det_idx, trk_idx = linear_sum_assignment(cost_matrix)
             for di, ti in zip(det_idx, trk_idx):
