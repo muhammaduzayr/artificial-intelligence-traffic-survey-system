@@ -103,3 +103,25 @@ def test_peak_hour_ignores_gap_bucket_correctly():
     # spanning all 4 buckets including the empty one in the middle.
     assert peak_start == datetime(2026, 8, 5, 8, 0, 0)
     assert peak_vol == 12
+
+
+def test_peak_hour_on_short_survey_never_predates_the_survey_start():
+    """Regression test found via a real short (~2.5 min) test run: with
+    only ONE 15-min bucket of data, the rolling window is necessarily
+    partial (min_periods=1), so shifting back by a flat (window-1)
+    buckets over-corrects and reports a peak hour starting BEFORE the
+    survey itself began. A naive version of this fix reported "06:45" as
+    the peak hour start for a clip that only covered 07:30-07:32.
+    """
+    start = datetime(2026, 2, 11, 7, 30, 0)
+    agg = ReportAggregator(start)
+
+    # All events land within the single 07:30-07:45 bucket (a 2.5-minute
+    # clip can't span more than one 15-min interval).
+    for i in range(5):
+        agg.add_events([FakeEvent(frame_idx=i, timestamp_sec=30 + i, track_id=i,
+                                   lane="N2", direction="N2", category="Car")])
+
+    peak_start, peak_vol = agg.peak_hour()
+    assert peak_start == datetime(2026, 2, 11, 7, 30, 0)
+    assert peak_vol == 5
