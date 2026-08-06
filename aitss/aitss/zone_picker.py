@@ -402,6 +402,9 @@ def pick_lines_interactive(video_path, start_frame=50,
     return lines
 
 
+_VALID_LINE_LABEL = re.compile(r"^[NSEW][1-4]?$")
+
+
 def write_lines_to_config(lines, config_path):
     """
     Writes START_LINES and FINISH_LINES dicts into config.py by replacing
@@ -411,6 +414,14 @@ def write_lines_to_config(lines, config_path):
            of (label, [p1, p2]) tuples as returned by pick_lines_interactive().
 
     Returns True on success, False if the config file doesn't exist.
+
+    Raises ValueError if any label isn't a plain N/S/E/W (+ optional
+    1-4) code. Labels are spliced directly into config.py's source below,
+    which is then imported and executed on every run — callers already
+    enforce this same pattern when prompting the user (see
+    terminal_label_prompt / run_gui.py's _bulk_label_dialog), but this
+    function is where the write itself happens, so it re-checks rather
+    than trusting every caller to have validated first.
     """
     if not os.path.exists(config_path):
         return False
@@ -429,7 +440,15 @@ def write_lines_to_config(lines, config_path):
         body_items = []
         if items:
             for label, pts in items:
-                body_items.append(f'    "{label}": [{pts[0]}, {pts[1]}],')
+                if not _VALID_LINE_LABEL.match(label):
+                    raise ValueError(
+                        f"Invalid line label {label!r} — must be a single "
+                        f"letter (N/S/E/W) or letter+digit (N1-N4/S1-S4/"
+                        f"E1-E4/W1-W4)."
+                    )
+                x1, y1 = (int(v) for v in pts[0])
+                x2, y2 = (int(v) for v in pts[1])
+                body_items.append(f'    "{label}": [({x1}, {y1}), ({x2}, {y2})],')
         body = "\n".join(body_items) if body_items else ""
         replacement = f'{name} = {{\n{body}\n}}' if body else f'{name} = {{}}'
         return pattern.sub(replacement, src, count=1)

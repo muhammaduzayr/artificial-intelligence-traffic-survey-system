@@ -77,7 +77,34 @@ BYTETRACK_HIGH_CONF_THRESHOLD = 0.50
 # detector.py resolves id -> category first (see VehicleDetector.__init__),
 # then does every per-class lookup below by name so it works for either.
 MIN_CONF_BY_CLASS = {
-    "Car": 0.07,          # 0.07 catches distant/blurry/night/angled cars (was 0.10)
+    # Raised 0.07->0.22 (2026-08-06) after a real counted false positive
+    # (a malformed 580x190px "Car" box spanning a pedestrian and a
+    # motorcyclist, conf=0.217) turned out to sit in a zone with almost no
+    # real precision. Built a proper eval harness: ran aitss_v4.pt over
+    # dataset_v4's held-out val split (243 images, never trained on),
+    # IoU-matched (>=0.5) every raw prediction against the hand-labeled
+    # ground truth. Car precision by confidence: [0.07-0.15)=2.6%,
+    # [0.15-0.25)=7.0%, [0.25-0.40)=31.1%, [0.60-0.80)=80.6%,
+    # [0.80-1.0)=98.9% (n=2957 raw preds). At 0.07 the floor was admitting
+    # huge numbers of near-certain false positives into the tracker.
+    #
+    # 0.25 (rather than 0.22) was tried first — single-frame recall over
+    # all 1205 ground-truth Car boxes looked fine (95.1%->93.2%, only 23
+    # more misses), but a full pipeline re-run on real footage showed an
+    # 8.2% total-COUNT drop (73->67), not the ~2% the single-frame stat
+    # implied: losing a track's early low-confidence admission can break
+    # its whole run at MIN_TRACK_AGE, not just cost one frame — an effect
+    # a single-frame precision/recall study can't see. 0.22 — the smallest
+    # value that still strictly clears the 0.217 false positive — was
+    # re-validated the SAME way (full pipeline, real footage, not just the
+    # eval harness) and cost only 1 count (73->72) while still confirmed
+    # removing that exact false positive. Judge any future change here by
+    # a full pipeline re-run on real footage, not single-frame eval-harness
+    # stats alone — they can disagree, and the full-pipeline number is
+    # what actually matters. Re-run the same harness (scratchpad
+    # eval_harness.py pattern, not preserved in the repo) against fresh
+    # footage before moving this further — don't retune blind.
+    "Car": 0.22,
     # Raised from 0.03 (2026-08-05): at the bare global floor, confirmed on
     # real debug-video footage that a persistent low-conf false positive on
     # a pavement stain (no motorcycle present at all) accumulated enough
@@ -134,12 +161,28 @@ MAX_BBOX_ASPECT = 6.0    # width/height upper bound (e.g. very wide flat boxes)
 # 100×200 px box cannot be a Motorcycle (too large).  These are loose
 # bounds — they only catch extreme misclassifications, not borderline cases.
 # Areas are in pixel² at the inference resolution (1920×1080 source).
+#
+# Max values recalibrated (2026-08-06) against the actual 1,626-frame CVAT
+# ground truth (training_data/dataset_v4) after finding the PREVIOUS values
+# were silently hard-rejecting a real, meaningful fraction of genuine
+# close-to-camera vehicles before they ever reached the tracker — not an
+# edge case:
+#   Motorcycle: old cap 30000, real hand-labeled max 68602 -> 3.9% rejected
+#   Car:        old cap 250000, real max 391213             -> 0.7% rejected
+#   Bus:        old cap 500000, real max 1209853             -> 5.2% rejected
+#   Truck:      old cap 500000, real max 565678               -> 2.8% rejected
+# New values keep real margin above the observed max (same "loose bound,
+# catch only the impossible" philosophy as the original design), not just
+# enough to cover this one sample. Light Truck is unchanged — it has no
+# data in dataset_v4 to validate against (aitss_v4.pt's own 4-class head
+# has no such category; Light Truck only exists for the stock-COCO code
+# path, see TRUCK_REFINE_AREA_THRESHOLD).
 CLASS_MAX_BBOX_AREA = {
-    "Car": 250000,          # ~500×500 box at IMGSZ (largest plausible single car)
-    "Motorcycle": 30000,    # ~173×173 box at IMGSZ (up from 6000 which rejected close MCs)
-    "Bus": 500000,          # ~707×707 box at IMGSZ (covers nearly full frame height)
-    "Truck": 500000,        # same as Bus
-    "Light Truck": 500000,
+    "Car": 450000,          # was 250000; real max 391213
+    "Motorcycle": 90000,    # was 30000; real max 68602
+    "Bus": 1600000,         # was 500000; real max 1209853
+    "Truck": 750000,        # was 500000; real max 565678
+    "Light Truck": 500000,  # unchanged — no dataset_v4 data for this class
 }
 CLASS_MIN_BBOX_AREA = {
     "Car": 40,          # ~6×7 box at IMGSZ (was 60)
@@ -206,6 +249,23 @@ CLASS_ASPECT_RANGE = {
     "Truck": (0.4, None),         # unchanged
     "Light Truck": (0.4, None),
 }
+# NOTE (2026-08-06): a Car upper bound of 2.5 was tried and reverted — see
+# git history / conversation notes. It was calibrated against a handful of
+# live examples from ONE test clip (S49 camera), which made real cars look
+# compact (aspect 0.86-1.4). Checked against the actual 1,626-frame CVAT
+# ground truth (training_data/dataset_v4) across all three cameras
+# (S49/L04/L18) before shipping it more broadly: genuine hand-labeled Car
+# boxes range up to aspect 6.75, with 1.9% (160/8310) exceeding 2.5 — not
+# a rare tail, a real chunk of legitimate broadside/turning cars on the
+# L18/L04 camera angles. That threshold would have silently undercounted
+# real vehicles on those cameras. A single false positive (see the
+# 2026-08-06 finding: a 580x190px conf=0.22 "Car" box spanning a
+# pedestrian and a motorcyclist, aspect 3.05) sits well inside that
+# legitimate range, so aspect ratio alone can't safely separate it from a
+# real broadside car — confidence and shape coherence would need to be
+# part of any real fix, not aspect ratio in isolation. Left unbounded
+# until a fix is validated the same way (against dataset_v4, not a single
+# clip) before it ships.
 
 # --- Route tracking ---
 
@@ -479,8 +539,7 @@ ZONE_RELINK_MIN_APPEARANCE_SIMILARITY = 0.3
 # crossing and begins tracking it for a future count.
 # Use python -m aitss.tools.pick_zone to click two endpoints per line.
 START_LINES = {
-    "N": [(809, 590), (1085, 466)],
-    "S": [(876, 299), (1019, 241)],
+    "N": [(682, 259), (1184, 311)],
 }
 
 # FINISH_LINES — one line segment per exit direction, keyed by the lane
@@ -490,8 +549,7 @@ START_LINES = {
 #   lane = the finish line's key (e.g. "N1")
 #   direction = the finish line's key (the direction label IS the lane)
 FINISH_LINES = {
-    "S2": [(572, 317), (679, 277)],
-    "N2": [(1286, 417), (1365, 314)],
+    "S2": [(939, 193), (1088, 189)],
 }
 
 # Aggregation interval in minutes (per the proposal: 15-minute reports).

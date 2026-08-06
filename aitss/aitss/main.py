@@ -47,6 +47,21 @@ def _suppress_stderr():
         sys.stderr = old_stderr
 
 
+def _sanitize_enumerator_dirname(enumerator):
+    """Turn a free-typed enumerator name into a single safe directory
+    segment.
+
+    enumerator comes straight from a CLI flag / GUI text field and is
+    joined onto output_dir to build the report path (see run() below).
+    Strip path separators and ".." so a value like "../../Windows" can't
+    make the report land outside output_dir.
+    """
+    name = enumerator.strip()
+    name = name.replace("\\", "_").replace("/", "_")
+    name = name.replace("..", "_")
+    return name.strip(" ._")
+
+
 def _rects_overlap(a, b):
     """Check if two (x1,y1,x2,y2) rects overlap (including touching)."""
     return a[0] < b[2] and a[2] > b[0] and a[1] < b[3] and a[3] > b[1]
@@ -166,7 +181,24 @@ def _place_label(bbox, label, font_scale, thickness, placed_rects, frame_shape):
 
 def draw_debug_frame(frame, detections, start_lines, finish_lines,
                      route_info=None, source_timestamp=None, frame_idx=None, fps=None,
-                     lane_counts=None):
+                     lane_counts=None, display_id_fn=None, display_category_fn=None):
+    # display_id_fn maps a track's internal track_id to the number actually
+    # shown on screen. Defaults to showing track_id as-is. When the caller
+    # passes VehicleDetector.display_id, a vehicle whose internal ID was
+    # bridged across a tracker ID switch (see detector.relink_kf) keeps
+    # showing its original number instead of visibly flipping to the new
+    # one — route_info/color-shift lookups still use the raw track_id
+    # since that's what the rest of the pipeline keys state by.
+    if display_id_fn is None:
+        display_id_fn = lambda tid: tid
+    # display_category_fn(tid, category) maps to the category actually
+    # shown/colored on screen. Defaults to the detection's own category
+    # (today's behavior). VehicleDetector.display_category returns a
+    # locked category's stable value instead, so a vehicle doesn't
+    # flicker to a different class label/color for a frame or two right
+    # after an ID switch.
+    if display_category_fn is None:
+        display_category_fn = lambda tid, category: category
     # --- source-time overlay ---
     if source_timestamp is not None:
         elapsed_video = frame_idx / fps if frame_idx is not None and fps else 0.0
@@ -206,6 +238,24 @@ def draw_debug_frame(frame, detections, start_lines, finish_lines,
         cv2.rectangle(frame, (lx, ly - th - 2), (lx + tw + 4, ly + 2), (0, 0, 0), -1)
         cv2.putText(frame, label, (lx + 2, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
+    # --- suppress freshly-spawned tracks from the overlay ---
+    # A track this young either becomes a real, confirmed vehicle (and
+    # starts being drawn within a few more frames) or gets silently
+    # rejected as static/noise a bit later — detector.py's static-motion
+    # filter needs STATIC_MIN_SAMPLES real detections before it can tell
+    # the two apart, so every transient false-positive blip (foliage,
+    # reflections, a parked vehicle's shadow) otherwise flashes on screen
+    # for its few-frame grace period before being rejected. Reusing the
+    # same MIN_TRACK_AGE gate already used to decide counting eligibility
+    # means a real vehicle's box just appears with a short, deliberate
+    # delay instead.
+    detections = [
+        d for d in detections
+        if d.get("age", 0) >= config.MIN_TRACK_AGE.get(
+            d["category"], config.MIN_TRACK_AGE.get("default", 0)
+        )
+    ]
+
     # --- detection boxes with collision-free label placement ---
     if not detections:
         return frame
@@ -222,22 +272,27 @@ def draw_debug_frame(frame, detections, start_lines, finish_lines,
             # --- Group label for dense clusters ---
             cats = {}
             for d in cluster:
-                cats[d["category"]] = cats.get(d["category"], 0) + 1
+                cat = display_category_fn(d["track_id"], d["category"])
+                cats[cat] = cats.get(cat, 0) + 1
             group_parts = [f"{n} {c}" for c, n in sorted(cats.items())]
             group_label = ", ".join(group_parts)
 
-            xs = [d["bbox"][0] for d in cluster] + [d["bbox"][2] for d in cluster]
-            ys = [d["bbox"][1] for d in cluster] + [d["bbox"][3] for d in cluster]
+            boxes = [d.get("display_bbox", d["bbox"]) for d in cluster]
+            xs = [b[0] for b in boxes] + [b[2] for b in boxes]
+            ys = [b[1] for b in boxes] + [b[3] for b in boxes]
             ux1, uy1, ux2, uy2 = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
 
             # Draw each box with a distinct thin color
             for i, d in enumerate(cluster):
-                bx1, by1, bx2, by2 = map(int, d["bbox"])
+                bx1, by1, bx2, by2 = map(int, d.get("display_bbox", d["bbox"]))
                 tid = d["track_id"]
-                color = _color_for_category(d["category"])
+                color = _color_for_category(display_category_fn(tid, d["category"]))
                 # Shift overlapping boxes by 1-2 px per track so they
-                # don't render flush on top of each other
-                shift = (tid % 5) - 2
+                # don't render flush on top of each other. Keyed by
+                # display_id (not the raw track_id) so a relinked vehicle's
+                # shift doesn't itself jump by 1-2px when its internal ID
+                # switches.
+                shift = (display_id_fn(tid) % 5) - 2
                 cv2.rectangle(frame, (bx1 + shift, by1 + shift),
                               (bx2 + shift, by2 + shift), color, 1)
 
@@ -255,19 +310,23 @@ def draw_debug_frame(frame, detections, start_lines, finish_lines,
             # --- Individual rendering with collision avoidance ---
             for d in cluster:
                 tid = d["track_id"]
-                x1, y1, x2, y2 = map(int, d["bbox"])
+                display_bbox = d.get("display_bbox", d["bbox"])
+                x1, y1, x2, y2 = map(int, display_bbox)
                 ri = route_info.get(tid) if route_info else None
                 route_changed = ri is not None and ri["route_changed"]
 
-                base_color = _color_for_category(d["category"])
+                shown_category = display_category_fn(tid, d["category"])
+                base_color = _color_for_category(shown_category)
                 color = (0, 0, 255) if route_changed else base_color
                 thickness = 3 if route_changed else 2
-                # Shift box slightly per track to separate overlapping boxes
-                shift = (tid % 5) - 2
+                # Shift box slightly per track to separate overlapping boxes.
+                # Keyed by display_id — see the group-label branch above.
+                shown_id = display_id_fn(tid)
+                shift = (shown_id % 5) - 2
                 cv2.rectangle(frame, (x1 + shift, y1 + shift),
                               (x2 + shift, y2 + shift), color, thickness)
 
-                label = f'#{tid} {d["category"]}'
+                label = f'#{shown_id} {shown_category}'
                 if route_changed:
                     label += " !"
 
@@ -281,7 +340,7 @@ def draw_debug_frame(frame, detections, start_lines, finish_lines,
                         route_label = o
 
                 # Place main label with collision avoidance
-                placed = _place_label(d["bbox"], label, 0.5, 1,
+                placed = _place_label(display_bbox, label, 0.5, 1,
                                       placed_label_rects, frame.shape)
                 if placed:
                     bg_rect, origin = placed
@@ -329,8 +388,9 @@ def run(video_path, survey_start_time, save_debug_video=False, output_dir=None, 
         survey_end_time=None, fps_override=None):
     if output_dir is None:
         output_dir = config.OUTPUT_DIR
-    if enumerator.strip():
-        output_dir = os.path.join(output_dir, enumerator.strip())
+    safe_enumerator = _sanitize_enumerator_dirname(enumerator)
+    if safe_enumerator:
+        output_dir = os.path.join(output_dir, safe_enumerator)
     os.makedirs(output_dir, exist_ok=True)
 
     # Per-video zone lines: sidecar .zones.json takes priority;
@@ -552,6 +612,8 @@ def run(video_path, survey_start_time, save_debug_video=False, output_dir=None, 
                     frame_idx=frame_idx,
                     fps=fps,
                     lane_counts=counter.get_lane_counts(),
+                    display_id_fn=detector.display_id,
+                    display_category_fn=detector.display_category,
                 )
 
             if save_debug_video:

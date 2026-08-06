@@ -1,7 +1,12 @@
-ultralytics>=8.2.0
-av>=18.0.0
-opencv-python>=4.9.0
-pandas>=2.2.0
-openpyxl>=3.1.0
-scipy>=1.10.0
-Pillow>=10.0.0
+# Pinned to exact versions verified working in this project's own venv,
+# rather than open-ended ">=" ranges — an unreviewed transitive upgrade
+# (e.g. a new ultralytics/opencv release) could silently change detection
+# behavior or introduce a supply-chain risk. Bump deliberately, one at a
+# time, and re-run the test suite + a real survey clip before committing.
+ultralytics==8.4.93
+av==18.0.0
+opencv-python==5.0.0.93
+pandas==3.0.3
+openpyxl==3.1.5
+scipy==1.18.0
+Pillow==12.3.0

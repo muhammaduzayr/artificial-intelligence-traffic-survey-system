@@ -306,6 +306,40 @@ class VehicleDetector:
         self._track_age = defaultdict(int)
         self._locked_category = {}     # track_id -> locked category (permanent once set)
 
+        # track_id -> the ID actually shown on screen. Absent entries just
+        # display as themselves (see display_id()). When relink_kf() bridges
+        # an internal ID switch, the new track_id inherits whatever number
+        # was already being displayed for the old one, so the on-screen
+        # label stays stable across a switch instead of visibly flipping to
+        # a new number for the same physical vehicle.
+        self._display_id = {}
+
+        # ── Display-only smoothing state ──────────────────────────────
+        # Parallel copies of the centroid/bbox median-filter histories and
+        # the category lock, used ONLY to render the debug/live overlay
+        # (draw_debug_frame's box + label) — never read by zone_counter or
+        # _match_detections. The real _track_centroid_history/
+        # _track_bbox_history/_locked_category (above) can't safely be
+        # carried across an ID switch in relink_kf: zone_counter builds its
+        # actual line-crossing point straight from det["centroid"]/
+        # det["bbox"], and backdating that history was confirmed (in
+        # testing) to silently change the total vehicle count. These
+        # parallel copies feed separate display_centroid/display_bbox
+        # fields and the display_category()/display_id() lookups instead,
+        # so they CAN be freely carried across a switch in relink_kf to
+        # keep the overlay stable, with zero path back into any counting
+        # or matching decision.
+        self._display_centroid_history = defaultdict(lambda: deque(maxlen=15))
+        self._display_bbox_history = defaultdict(lambda: deque(maxlen=3))
+        # Keyed by display_id (not track_id) — a locked category should
+        # stay attached to the physical vehicle's stable on-screen number
+        # across any number of relinks, not to whichever internal track_id
+        # happened to be live when it was locked. Not cleaned up on track
+        # expiry: it's bounded by the total number of distinct vehicles
+        # ever locked in the survey (not per-relink), so it stays tiny
+        # (a few thousand int->str entries at most) for the life of a run.
+        self._display_locked_category = {}
+
         # Track lifecycle tracking (for ID-reuse / double-count diagnostics).
         self._track_created_at = {}
         self._track_last_seen = {}
@@ -506,6 +540,7 @@ class VehicleDetector:
             print(f"[cat-lock-force] track={track_id} max_conf={best_entry[1]:.3f} "
                   f"cat={best_cat} (overriding smoothed vote)")
             self._locked_category[track_id] = best_cat
+            self._display_locked_category[self.display_id(track_id)] = best_cat
             return
 
         if category is None:
@@ -516,10 +551,12 @@ class VehicleDetector:
             if weights:
                 best = max(weights, key=weights.get)
                 self._locked_category[track_id] = best
+                self._display_locked_category[self.display_id(track_id)] = best
                 print(f"[cat-lock-start] track={track_id} locked={best} "
                       f"(w={weights[best]:.1f}/{sum(weights.values()):.1f} n={len(recent)})")
         else:
             self._locked_category[track_id] = category
+            self._display_locked_category[self.display_id(track_id)] = category
             print(f"[cat-lock-start] track={track_id} locked={category} (explicit)")
 
     def retire_track(self, tid):
@@ -546,9 +583,33 @@ class VehicleDetector:
         """
         self._protected_tracks.add(tid)
 
+    def display_id(self, tid):
+        """Return the ID to show on screen for this internal track_id.
+
+        Usually just tid itself. After relink_kf() bridges an ID switch,
+        this returns whatever number was already being displayed for the
+        vehicle before the switch, so the on-screen label doesn't flip to
+        a new number mid-crossing.
+        """
+        return self._display_id.get(tid, tid)
+
+    def display_category(self, tid, fallback_category):
+        """Return the category to show on screen for this track_id.
+
+        Once a vehicle's category has been locked (start-line crossing —
+        see lock_category), this returns that locked value forever,
+        looked up by display_id() rather than the raw track_id so it
+        stays correct across any number of later ID switches. Before a
+        lock exists (or for a track that never crosses a start line),
+        falls back to *fallback_category* — normally the caller's current
+        per-frame det["category"], i.e. today's un-stabilized behavior.
+        """
+        return self._display_locked_category.get(self.display_id(tid), fallback_category)
+
     def relink_kf(self, old_tid, new_tid):
-        """Carry Kalman-filter state from an old track_id to a new one
-        across an ID switch confirmed by ZoneCounter._relink_orphans.
+        """Carry Kalman-filter velocity and display-only state from an old
+        track_id to a new one across an ID switch confirmed by
+        ZoneCounter._relink_orphans.
 
         Called AFTER track_stream() has already run its per-frame KF step
         for this frame, which means new_tid's KF (if it's not brand new)
@@ -560,6 +621,33 @@ class VehicleDetector:
         _kf_last_frame is deliberately left untouched for the same reason:
         it's already correct for new_tid.
 
+        IMPORTANT — what this deliberately does NOT touch: an earlier
+        version of this method also merged _track_centroid_history,
+        _track_bbox_history, and _category_history/_locked_category across
+        the switch, on the theory that those are just more "smoothing
+        state". They aren't purely cosmetic: _smooth_centroids/
+        _smooth_bboxes write into det["centroid"]/det["bbox"], and
+        zone_counter.py builds its actual line-crossing point directly
+        from those two fields (see the centroid_raw = (det["centroid"][0],
+        bbox[3]) line in ZoneCounter.update). Backdating that history
+        measurably changed which frame a crossing registered on, which
+        cascades through _update_active_tracks into every later frame's
+        matching cost — confirmed by a real test run where it silently
+        changed the total counted vehicles by 12% (73 -> 64) on a 150s
+        clip. Category has a narrower but real path too, via the
+        category-match gate in ZoneCounter._relink_orphans. So the ONLY
+        counting-facing state this method touches is KF velocity (this
+        frame's fresh position stays authoritative regardless).
+
+        Everything else transferred below is either provably display-only
+        already (_kf_smooth, documented by _kalman_step's own comment as
+        "never used by zone_counter's counting logic") or belongs to the
+        separate _display_* parallel state (see __init__) that was built
+        specifically so it CAN be carried across a switch without any of
+        the risk above — display_centroid/display_bbox/display_category
+        are never read by zone_counter or _match_detections, only by
+        draw_debug_frame's rendering.
+
         Falls back to moving the whole KF over when new_tid has no KF yet
         (shouldn't happen given the call ordering, but don't assume it).
         """
@@ -568,18 +656,40 @@ class VehicleDetector:
             self._kf[new_tid].x[3] = self._kf[old_tid].x[3]
             self._kf.pop(old_tid, None)
             self._kf_last_frame.pop(old_tid, None)
-            self._kf_smooth.pop(old_tid, None)
         else:
             if old_tid in self._kf:
                 self._kf[new_tid] = self._kf.pop(old_tid)
             if old_tid in self._kf_last_frame:
                 self._kf_last_frame[new_tid] = self._kf_last_frame.pop(old_tid)
-            if old_tid in self._kf_smooth:
-                self._kf_smooth[new_tid] = self._kf_smooth.pop(old_tid)
+        if old_tid in self._kf_smooth:
+            self._kf_smooth[new_tid] = self._kf_smooth.pop(old_tid)
         if old_tid in self._track_heading:
             self._track_heading[new_tid] = self._track_heading.pop(old_tid)
         if old_tid in self._track_area_history:
             self._track_area_history[new_tid] = self._track_area_history.pop(old_tid)
+
+        if old_tid in self._display_centroid_history:
+            self._display_centroid_history[new_tid] = self._prepend_history(
+                self._display_centroid_history.pop(old_tid), self._display_centroid_history[new_tid]
+            )
+        if old_tid in self._display_bbox_history:
+            self._display_bbox_history[new_tid] = self._prepend_history(
+                self._display_bbox_history.pop(old_tid), self._display_bbox_history[new_tid]
+            )
+
+        self._display_id[new_tid] = self._display_id.get(old_tid, old_tid)
+        self._display_id.pop(old_tid, None)
+
+    @staticmethod
+    def _prepend_history(old_hist, new_hist):
+        """Merge an old track's display-history deque in front of a new
+        track's, preserving the new deque's maxlen (most-recent-N
+        semantics). Only ever used on the _display_* parallel state in
+        relink_kf — see that method's docstring for why the counting-facing
+        histories can't safely use this same trick."""
+        if not old_hist:
+            return new_hist
+        return deque(list(old_hist) + list(new_hist), maxlen=new_hist.maxlen)
 
     def _smooth_centroids(self, detections):
         """Smooth centroid positions with progressive strength.
@@ -655,6 +765,71 @@ class VehicleDetector:
                     cx + mw / 2,
                     cy + mh / 2,
                 )
+
+    def _smooth_display_centroids(self, detections):
+        """Display-only twin of _smooth_centroids.
+
+        Same median-smoothing algorithm, but reads/writes a completely
+        separate history (_display_centroid_history) and field
+        (d["display_centroid"]) instead of _track_centroid_history/
+        d["centroid"] — see the _display_* state comment in __init__ for
+        why that separation matters. Must run BEFORE _smooth_display_bboxes
+        (which uses d["display_centroid"] as its box center), and reads
+        d["centroid"] as its raw input — call it before _smooth_centroids
+        has a chance to overwrite that field in place, i.e. in the same
+        relative order as the real pair.
+        """
+        for d in detections:
+            tid = d["track_id"]
+            raw = d["centroid"]
+            hist = self._display_centroid_history[tid]
+            hist.append(raw)
+            n = len(hist)
+            if n < 2:
+                d["display_centroid"] = raw
+                continue
+            window = list(hist)[-min(n, 7):]
+            nw = len(window)
+            if nw >= 3:
+                xs = sorted(p[0] for p in window)
+                ys = sorted(p[1] for p in window)
+                mid = nw // 2
+                d["display_centroid"] = (xs[mid], ys[mid])
+            else:
+                d["display_centroid"] = (
+                    (window[0][0] + window[1][0]) / 2,
+                    (window[0][1] + window[1][1]) / 2,
+                )
+
+    def _smooth_display_bboxes(self, detections):
+        """Display-only twin of _smooth_bboxes — see
+        _smooth_display_centroids and the _display_* state comment in
+        __init__. Must run after _smooth_display_centroids (uses
+        d["display_centroid"] as the box center) but reads d["bbox"] as
+        its raw input, same as the real _smooth_bboxes does.
+        """
+        for d in detections:
+            tid = d["track_id"]
+            raw_bbox = d["bbox"]
+            x1, y1, x2, y2 = raw_bbox
+            hist = self._display_bbox_history[tid]
+            hist.append((x2 - x1, y2 - y1))
+
+            if len(hist) >= 3:
+                cx, cy = d["display_centroid"]
+                ws = sorted(p[0] for p in hist)
+                hs = sorted(p[1] for p in hist)
+                mid = len(ws) // 2
+                mw = ws[mid]
+                mh = hs[mid]
+                d["display_bbox"] = (
+                    cx - mw / 2,
+                    cy - mh / 2,
+                    cx + mw / 2,
+                    cy + mh / 2,
+                )
+            else:
+                d["display_bbox"] = raw_bbox
 
     def _predict_position(self, state, gap=None):
         """Predict current centroid, scaling velocity by the actual frame gap."""
@@ -1450,6 +1625,9 @@ class VehicleDetector:
             self._track_occluder_since.pop(tid, None)
             self._retired_tracks.discard(tid)
             self._protected_tracks.discard(tid)
+            self._display_id.pop(tid, None)
+            self._display_centroid_history.pop(tid, None)
+            self._display_bbox_history.pop(tid, None)
 
     @staticmethod
     def _cross_class_nms(detections, iou_threshold=None):
@@ -1901,6 +2079,12 @@ class VehicleDetector:
                     self._kalman_step(detections, frame_idx)
                     detections = self._filter_static_tracks(detections, frame_idx)
                     self._update_active_tracks(detections, frame_idx)
+                    # Display-only smoothing must run first — it reads
+                    # d["centroid"]/d["bbox"] as raw input, before the
+                    # counting-facing smoothers below overwrite them in
+                    # place. See _smooth_display_centroids's docstring.
+                    self._smooth_display_centroids(detections)
+                    self._smooth_display_bboxes(detections)
                     self._smooth_centroids(detections)
                     self._smooth_bboxes(detections)
                     # Update active tracks with smoothed positions so that

@@ -69,7 +69,7 @@ def main():
                 continue
 
             raw = detector._inference_frame(frame)
-            dets = detector._match_detections(raw, args.sample_step)
+            dets = detector._match_detections(raw, args.sample_step, frame_idx)
             detector._update_active_tracks(dets, frame_idx)
             for det in dets:
                 tid = det["track_id"]
